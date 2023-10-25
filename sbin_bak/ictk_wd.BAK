@@ -1,0 +1,367 @@
+#include <stdio.h>
+#include <sys/time.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <unistd.h>
+#include <time.h>
+#include <signal.h>
+#include <libgen.h>
+#include <sys/wait.h>
+#include <syslog.h>
+#include <stdarg.h>
+#include <sys/stat.h>
+#include "ictk_wd.h"
+
+#define MAX_TOKEN_SLOT          10
+#define MAX_ARG_NUM             64
+#define     MAX_FULLPATH_SIZE       1023
+#define TRUE	1
+#define FALSE	0
+#define E_RET	-1
+
+//char *xstrchr(char *string, int delimiter);
+
+typedef struct ProcInfo {
+        char
+                user[10],               /* user name corresponding to owner of process */
+                cmd[40],                /* basename of executable file in call to exec(2) */
+                state,                  /* single-char code for process state (S=sleeping) */
+                ttyc[5],                /* string representation of controlling tty device */
+                **environ,              /* environment string vector (/proc/#/environ) */
+                **cmdline;              /* command line string vector (/proc/#/cmdline) */
+        int
+                uid,                    /* user id */
+                pid,                    /* process id */
+                ppid,                   /* pid of parent process */
+                pgrp,                   /* process group id */
+                session,                /* session id */
+                tty,                    /* full device number of controlling terminal */
+                tpgid,                  /* terminal process group id */
+                priority,               /* kernel scheduling priority */
+                nice;                   /* standard unix nice level of process */
+        long long
+                signal,                 /* mask of pending signals */
+                blocked,                /* mask of blocked signals */
+                sigignore,              /* mask of ignored signals */
+                sigcatch;               /* mask of caught  signals */
+        long
+                start_time,             /* start time of process -- seconds since 1-1-70 */
+                utime,                  /* user-mode CPU time accumulated by process */
+                stime,                  /* kernel-mode CPU time accumulated by process */
+                cutime,                 /* cumulative utime of process and reaped children */
+                cstime,                 /* cumulative stime of process and reaped children */
+                                        /* the next 7 members come from /proc/#/statm */
+                size,                   /* total # of pages of memory */
+                resident,               /* number of resident set (non-swapped) pages (4k) */
+                share,                  /* number of pages of shared (mmap'd) memory */
+                trs,                    /* text resident set size */
+                lrs,                    /* shared-lib resident set size */
+                drs,                    /* data resident set size */
+                dt;                                      /* dirty pages */
+        unsigned
+                pcpu;                   /* %CPU usage (is not filled in by readproc!!!) */
+        unsigned long
+                vsize,                  /* number of pages of virtual memory ... */
+                rss,                    /* resident set size from /proc/#/stat */
+                rss_rlim,               /* resident set size ... ? */
+                timeout,                /* ? */
+                it_real_value,          /* ? */
+                flags,                  /* kernel flags for the process */
+		min_flt,                /* number of minor page faults since process start */
+                maj_flt,                /* number of major page faults since process start */
+                cmin_flt,               /* cumulative min_flt of process and child processes */
+                cmaj_flt,               /* cumulative maj_flt of process and child processes */
+                start_code,             /* address of beginning of code segment */
+                end_code,               /* address of end of code segment */
+                start_stack,            /* address of the bottom of stack for the process */
+                kstk_esp,               /* kernel stack pointer */
+                kstk_eip,               /* kernel stack pointer */
+                wchan;                  /* address of kernel wait channel proc is sleeping in */
+                struct proc_s *l,       /* ptrs for building arbitrary linked structs */
+                *r;                     /* (i.e. singly/doubly-linked lists and trees */
+} stProcInfo;
+
+void stat2proc(char*S, struct ProcInfo *P) {
+        char* tmp = strrchr(S, ')');            /* split into "PID (cmd" and "<rest>" */
+        *tmp = '\0';                                            /* replace trailing ')' with NUL */
+        /* parse these two strings separately, skipping the leading "(". */
+        memset(P->cmd, 0, sizeof P->cmd);   /* clear even though *P xcalloc'd ?! */
+        sscanf(S, "%d (%39c", &P->pid, P->cmd);
+        sscanf(tmp + 2,                                  /* skip space after ')' too */
+                "%c %d %d %d %d %d %lu %lu %lu %lu %lu %ld %ld %ld %ld %d "
+                "%d %lu %lu %ld %lu %lu %lu %lu %lu %lu %lu %lu %LX %LX %LX %LX %lu",
+                &P->state, &P->ppid, &P->pgrp, &P->session, &P->tty, &P->tpgid,
+                &P->flags, &P->min_flt, &P->cmin_flt, &P->maj_flt, &P->cmaj_flt,
+                &P->utime, &P->stime, &P->cutime, &P->cstime, &P->priority, &P->nice,
+                &P->timeout, &P->it_real_value, &P->start_time, &P->vsize, &P->rss,
+                &P->rss_rlim, &P->start_code, &P->end_code, &P->start_stack,
+                &P->kstk_esp, &P->kstk_eip, &P->signal, &P->blocked, &P->sigignore,
+                &P->sigcatch, &P->wchan);
+
+                if (P->tty == 0)
+                        P->tty = -1;  /* the old notty val, update elsewhere bef. moving to 0 */
+}
+
+
+int     ntokslot[MAX_TOKEN_SLOT] = {0, };
+char    *ptokstr[MAX_TOKEN_SLOT] = {(char *)NULL, };
+int     g_nShutdown = 0;
+int     g_nReConfig = 0;
+
+void sig_term(int sig){
+        g_nShutdown = 1;
+}
+
+void sig_hup(int sig){
+ //       g_nReConfig = 1;
+}
+
+void SetSignal(){
+        struct sigaction sa;
+
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+
+        sa.sa_handler = sig_term;
+        sigaction(SIGTERM, &sa, NULL);
+
+        sa.sa_handler = sig_hup;
+        sigaction(SIGHUP, &sa, NULL);
+
+        sa.sa_handler = SIG_IGN;
+        sigaction(SIGINT, &sa, NULL);
+}
+
+int get_tokslot(void)
+{
+        int i;
+
+        for (i=0; i<MAX_TOKEN_SLOT; i++)
+        {
+                if (ntokslot[i] == 0)
+                {
+                        ntokslot[i] = 1;
+                        return i;
+                }
+        }
+
+        return -1;
+}
+
+
+void return_tokslot(int slot)
+{
+        ntokslot[slot] = 0;
+        ptokstr[slot] = (char *)NULL;
+}
+
+char *xstrtok(char *string, int delimiter, int slot)
+{
+        char *cp = (char *)NULL;
+        char *ptstr = string;
+
+        if (ptstr != (char *)NULL)
+                ptokstr[slot] = ptstr;
+
+        if (ptokstr[slot] == (char *)NULL)              // || ptokstr[slot][0] == 0x00)
+                return (char *)NULL;
+
+        if ((cp = xstrchr(ptokstr[slot], delimiter)) != (char *)NULL)
+        {
+                *cp++ = 0x00;
+                ptstr = cp;
+                cp = ptokstr[slot];
+                ptokstr[slot] = ptstr;
+        }
+        else            /* End of Token */
+        {
+                cp = ptokstr[slot];
+                ptokstr[slot] = (char *)NULL;
+        }
+
+        return (cp);
+}
+
+void daemon_init()
+{
+        int     nFd;
+        const int nMaxFd = 64;
+        pid_t nPid;
+
+        nPid = fork();
+        if ( nPid < 0 )
+                exit(1);
+
+        if ( nPid > 0 ) /* parent process teminates */
+                exit(0);
+
+        setsid();
+
+        nPid = fork();
+        if ( nPid < 0 )
+                exit(1);
+
+        if ( nPid > 0 ) /* parent process teminates */
+                exit(0);
+
+        chdir("/");
+        umask(0);
+
+        /* close out the standard file descriptors */
+        freopen("/dev/null", "r", stdin);
+        freopen("/dev/null", "w", stdout);
+        freopen("/dev/null", "w", stderr);
+
+        /* close all file descriptor */
+        for (nFd=3; nFd<nMaxFd; nFd++)
+                close(nFd);
+}
+
+
+char *xstrchr(char *string, int delimiter)
+{
+        char *tp = (char *)NULL;
+        int qm_detected = FALSE;        /* Quotation Mark is found */
+
+        if (string == (char *)NULL)
+                return (char *)NULL;
+
+        tp = string;
+        while (*tp != 0x00)
+        {
+                if ((*tp == '\"') || (*tp == '\''))
+                {
+                        if (qm_detected == FALSE)
+                                qm_detected = TRUE;
+                        else
+                                qm_detected = FALSE;
+                }
+                else
+                {
+                        if ((*tp == delimiter) && (qm_detected == FALSE))
+                                return tp;
+                }
+
+                *tp++;
+        }
+
+        return (char *)NULL;
+}
+
+int do_cmd_set(char *szCmd)
+{
+        char seps = ' ';
+        char *token;
+        char **args;
+        int p_stat, i, ret, slot;
+        char cmd[MAX_FULLPATH_SIZE+1];
+        pid_t pid;
+
+        strncpy(cmd, szCmd, MAX_FULLPATH_SIZE+1);
+        i=0;
+
+        args = (char **)malloc(sizeof(char *)*MAX_ARG_NUM);
+
+        slot = get_tokslot();
+        if (slot == -1)
+        {
+                free(args);
+                return FALSE;
+        }
+
+        token = xstrtok(cmd, seps, slot);
+        while( token != NULL )
+        {
+                /* Remove Quotation Mark in Token */
+                if (*token == '\"')
+                {
+                        *token++;
+                        ret = strlen(token);
+                        if (*(token+ret-1) == '\"')
+                                *(token+ret-1) = 0x00;
+                }
+
+                args[i] = token;
+                i++;
+                token = xstrtok(NULL, seps, slot);
+        }
+        args[i] = token;
+        return_tokslot(slot);
+
+        pid = fork();
+        if (pid < 0)
+        {
+                free(args);
+                return E_RET;
+        }
+
+	if (pid == 0)
+        {
+                ret = execv(args[0], args);
+                if (ret < 0)
+                {
+                        exit (errno);
+                }
+
+                exit(0);
+        }
+        /* parent process */
+        else
+        {
+                waitpid(pid, &p_stat, 0);
+                free(args);
+
+                if (WIFEXITED(p_stat))
+                {
+                        if (WEXITSTATUS(p_stat)==0)
+                        {
+                                return TRUE;
+                        }
+                        else
+                        {
+                                errno = WEXITSTATUS(p_stat);
+                                return E_RET;
+                        }
+                }
+                else
+                {
+                        return FALSE;
+                }
+        }
+        return TRUE;
+}
+
+int main(int argc, char *argv[])
+{
+	FILE *fp;
+        int nRet, nCheckCount=0, nWaitProcess=0, nFailCount=0, nFailCount2=0;
+        int nLogRotate = 1; /* º¸¾È·Î±× ÆÄÀÏ Rotate ¿©ºÎ(1:rotate,0:not rotate) */
+        char szPidFilePath[MAX_FULLPATH_SIZE + 1];
+        char szCheckPIDFilePath[MAX_FULLPATH_SIZE + 1];
+        char szCheckSosdPIDFilePath[MAX_FULLPATH_SIZE + 1];
+        char szCheckProcessName[32];
+        char szCmdPath[MAX_FULLPATH_SIZE + 1];
+        char szBuf[1024];
+	
+	umask(022);	
+/*
+	daemon_init(); 
+        SetSignal(); 
+*/
+	printf("test ~~~\n");
+
+	while (1)
+	{
+		char szCmdPath[MAX_FULLPATH_SIZE + 1] = {0};
+		sprintf (szCmdPath, "/usr/local/ictk/rotD");
+		nRet = do_cmd_set(szCmdPath);
+		sleep(15);
+	}
+
+	return 0;
+}
